@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from ollama import Client # <--- Importamos Client para conectar remoto
+from ollama import Client
 from pdf2image import convert_from_path
 import tempfile
 import os
@@ -9,23 +9,18 @@ import time
 import io
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Nexus Extractor (Remoto)", layout="wide")
-st.title("🌐 Nexus Extractor: Motor Centralizado (Ollama)")
+st.set_page_config(page_title="Nexus Extractor (Ollama Cloud)", layout="wide")
+st.title("☁️ Nexus Extractor: Ollama Cloud Oficial")
 
-# ==========================================
-# 🔌 CONFIGURACIÓN DE CONEXIÓN AL SERVIDOR
-# ==========================================
-# CAMBIA ESTO POR LA IP DE TU PC POTENTE
-IP_SERVIDOR_OLLAMA = "192.168.1.50"  # <--- ¡PON TU IP AQUÍ!
-PUERTO_OLLAMA = "11434"
-
-# Inicializamos el cliente apuntando al servidor
-try:
-    client = Client(host=f'http://{IP_SERVIDOR_OLLAMA}:{PUERTO_OLLAMA}')
-    client.list() # Prueba de conexión
-    st.sidebar.success(f"✅ Conectado al Servidor: {IP_SERVIDOR_OLLAMA}")
-except Exception as e:
-    st.sidebar.error(f"❌ Error conectando a {IP_SERVIDOR_OLLAMA}. ¿Ollama está corriendo con OLLAMA_HOST=0.0.0.0?")
+# 1. Configurar Cliente para Ollama Cloud
+if "OLLAMA_API_KEY" in st.secrets:
+    # Conexión al endpoint oficial de la nube de Ollama
+    client = Client(
+        host='https://api.ollama.com',
+        headers={'Authorization': f'Bearer {st.secrets["OLLAMA_API_KEY"]}'}
+    )
+else:
+    st.error("❌ Falta la OLLAMA_API_KEY en secrets.toml")
     st.stop()
 
 # ==========================================
@@ -35,23 +30,23 @@ PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
         Analiza esta imagen de factura.
         REGLAS:
-        1. Si ves "Duplicado" o "Copia", el JSON debe tener "tipo_documento": "Copia" y "items": [].
+        1. Si ves "Duplicado" o "Copia", JSON: {"tipo_documento": "Copia", "items": []}.
         2. Si es Original, extrae todo.
-        Responde SOLO con este JSON:
+        JSON ESPERADO:
         {"tipo_documento": "Original/Copia", "numero_factura": "...", "fecha": "...", "orden_compra": "...", "proveedor": "...", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.00, "total_linea": 0.00}], "total_factura": 0.00}
     """,
     "Factura RadioShack": """
-        Factura RadioShack. Extrae datos en JSON. Usa SKU como 'modelo'.
+        Factura RadioShack. Extrae en JSON. Usa SKU como 'modelo'.
         JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "RadioShack", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0}
     """,
     "Factura Mabe": """
-        Factura Mabe. Extrae datos en JSON. Usa CODIGO MABE como 'modelo'.
+        Factura Mabe. Extrae en JSON. Usa CODIGO MABE como 'modelo'.
         JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "Mabe", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "total_linea": 0.0}], "total_factura": 0.0}
     """
 }
 
 # ==========================================
-# 🧠 LÓGICA DE ANÁLISIS (REMOTO)
+# 🧠 LÓGICA DE ANÁLISIS
 # ==========================================
 def analizar_pagina(image, prompt_sistema):
     try:
@@ -60,12 +55,13 @@ def analizar_pagina(image, prompt_sistema):
         image.save(img_byte_arr, format='JPEG')
         img_bytes = img_byte_arr.getvalue()
 
-        # 2. Llamada al SERVIDOR OLLAMA (Usando el objeto 'client' que configuramos arriba)
+        # 2. Llamada a OLLAMA CLOUD
+        # NOTA: Verifica que el modelo exista en la nube. Si llama3.2-vision no está, prueba 'llama3.2' (pero podría no ver imágenes).
         response = client.chat(
             model='llama3.2-vision', 
             messages=[{
                 'role': 'user',
-                'content': prompt_sistema + " IMPORTANTE: Responde ÚNICAMENTE con el JSON válido.",
+                'content': prompt_sistema + " Responde SOLO con JSON.",
                 'images': [img_bytes]
             }]
         )
@@ -81,7 +77,7 @@ def analizar_pagina(image, prompt_sistema):
         return json.loads(texto_respuesta), None
 
     except Exception as e:
-        return {}, f"Error Servidor: {str(e)}"
+        return {}, f"Error Ollama Cloud: {str(e)}"
 
 # ==========================================
 # ⚙️ PROCESAMIENTO
@@ -96,7 +92,7 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     items_locales = []
     resumen_local = []
     
-    my_bar = st.progress(0, text=f"Enviando a Cerebro Central: {filename}...")
+    my_bar = st.progress(0, text=f"Procesando {filename} en la Nube de Ollama...")
 
     for i, img in enumerate(images):
         data, error = analizar_pagina(img, prompt)
@@ -128,18 +124,18 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
 # 🖥️ INTERFAZ
 # ==========================================
 with st.sidebar:
-    st.header("Configuración de Red")
+    st.header("Configuración")
     tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
-    st.info(f"📡 Conectado a: {IP_SERVIDOR_OLLAMA}")
+    st.info("☁️ Conectado a Ollama Official Cloud")
 
 uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files and st.button("🚀 Procesar en Servidor"):
+if uploaded_files and st.button("🚀 Procesar"):
     gran_acumulado = []
     st.divider()
     for uploaded_file in uploaded_files:
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            with st.spinner(f"El servidor está pensando..."):
+            with st.spinner(f"Analizando..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.read())
                     path = tmp.name
@@ -161,4 +157,4 @@ if uploaded_files and st.button("🚀 Procesar en Servidor"):
     if gran_acumulado:
         st.divider()
         csv = pd.DataFrame(gran_acumulado).to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_remota.csv", "text/csv")
+        st.download_button("📥 Descargar Todo (CSV)", csv, "extraccion_ollama_cloud.csv", "text/csv")
