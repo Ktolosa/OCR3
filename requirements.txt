@@ -3,3 +3,4 @@ pandas
 ollama
 pdf2image
 xlsxwriter
+requests  <-- AGREGA ESTO
