@@ -2,4 +2,4 @@ streamlit
 pandas
 ollama
 pdf2image
-pillow
+xlsxwriter
