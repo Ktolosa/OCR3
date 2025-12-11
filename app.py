@@ -10,7 +10,7 @@ import base64
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Nexus Híbrido", layout="wide")
-st.title("⚡ Nexus Extractor: Nube + Ollama Local (Modo CPU)")
+st.title("⚡ Nexus Extractor: Nube + Ollama Local (Modo HTTP)")
 
 # 1. RECUPERAR URL DE NGROK
 ngrok_url = st.secrets.get("OLLAMA_HOST")
@@ -19,7 +19,12 @@ if not ngrok_url:
     st.error("❌ Falta el secreto 'OLLAMA_HOST'.")
     st.stop()
 
+# --- CORRECCIÓN DEFINITIVA PARA ERRORES SSL ---
+# 1. Quitamos la barra del final si existe
 ngrok_url = ngrok_url.rstrip('/')
+# 2. FORZAMOS HTTP (Quitamos la 's' de https)
+# Esto evita que Python intente hacer el saludo SSL que está fallando
+ngrok_url = ngrok_url.replace("https://", "http://")
 
 # ==========================================
 # 🧠 DEFINICIÓN DE PROMPTS
@@ -65,7 +70,7 @@ PROMPTS_POR_TIPO = {
 # ==========================================
 def codificar_imagen_base64(image):
     buffered = io.BytesIO()
-    # Optimizamos un poco la compresión JPG para que viaje más rápido
+    # Calidad media para acelerar la transmisión y evitar timeouts
     image.save(buffered, format="JPEG", quality=85)
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return img_str
@@ -88,19 +93,22 @@ def analizar_pagina_raw(image, prompt_sistema):
             ]
         }
         
-        # --- AQUÍ ESTÁ EL CAMBIO CLAVE: TIMEOUT 600 ---
+        # Enviamos la petición
         response = requests.post(
             f"{ngrok_url}/api/chat",
             json=payload,
             headers={'ngrok-skip-browser-warning': 'true'},
-            verify=False,
-            timeout=600  # <--- 10 MINUTOS DE ESPERA (Antes eran 2)
+            verify=False, # Ignoramos SSL por si Ngrok nos redirige
+            timeout=600   # 10 minutos de paciencia
         )
         
         if response.status_code == 200:
-            respuesta_json = response.json()
-            contenido = respuesta_json['message']['content']
-            return json.loads(contenido), None
+            try:
+                respuesta_json = response.json()
+                contenido = respuesta_json['message']['content']
+                return json.loads(contenido), None
+            except Exception as e:
+                return {}, f"Error leyendo JSON de Ollama: {e} - Resp: {response.text[:100]}"
         else:
             return {}, f"Error del Servidor ({response.status_code}): {response.text}"
 
@@ -113,8 +121,7 @@ def analizar_pagina_raw(image, prompt_sistema):
 def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     try:
-        # --- CAMBIO CLAVE: BAJAMOS DPI A 150 ---
-        # Esto hace la imagen más pequeña y rápida de procesar para tu CPU
+        # DPI 150 es el balance perfecto velocidad/lectura
         images = convert_from_path(pdf_path, dpi=150) 
     except Exception as e:
         return [], [], f"Error Poppler: {e}"
@@ -123,7 +130,7 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     resumen_local = []
     ultimo_factura = "S/N"
     
-    my_bar = st.progress(0, text=f"Tu PC está pensando (Paciencia)... {filename}")
+    my_bar = st.progress(0, text=f"Tu PC está pensando... {filename}")
 
     for i, img in enumerate(images):
         data, error = analizar_pagina_raw(img, prompt)
@@ -172,7 +179,8 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
 with st.sidebar:
     st.header("Configuración")
     tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
-    st.info(f"Conectado a: {ngrok_url}")
+    # Mostramos a dónde nos estamos conectando para depurar
+    st.code(f"Destino: {ngrok_url}")
 
 uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
@@ -182,7 +190,7 @@ if uploaded_files and st.button("🚀 Procesar Remotamente"):
     
     for uploaded_file in uploaded_files:
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            with st.spinner(f"Tu PC está analizando (Puede tardar varios minutos)..."):
+            with st.spinner(f"Enviando datos a El Salvador..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.read())
                     path = tmp.name
