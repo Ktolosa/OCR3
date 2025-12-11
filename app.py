@@ -5,12 +5,12 @@ import tempfile
 import os
 import json
 import io
-import requests # <--- Usamos requests para tener control total
+import requests
 import base64
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Nexus Híbrido", layout="wide")
-st.title("⚡ Nexus Extractor: Nube + Ollama Local (Modo Seguro)")
+st.title("⚡ Nexus Extractor: Nube + Ollama Local (Modo CPU)")
 
 # 1. RECUPERAR URL DE NGROK
 ngrok_url = st.secrets.get("OLLAMA_HOST")
@@ -19,7 +19,6 @@ if not ngrok_url:
     st.error("❌ Falta el secreto 'OLLAMA_HOST'.")
     st.stop()
 
-# Aseguramos que la URL no tenga barra al final
 ngrok_url = ngrok_url.rstrip('/')
 
 # ==========================================
@@ -62,22 +61,19 @@ PROMPTS_POR_TIPO = {
 }
 
 # ==========================================
-# 🛠️ FUNCIONES MANUALES (SIN LIBRERÍA OLLAMA)
+# 🛠️ FUNCIONES MANUALES
 # ==========================================
 def codificar_imagen_base64(image):
-    """Convierte la imagen a texto Base64 para enviarla por HTTP"""
     buffered = io.BytesIO()
-    image.save(buffered, format="JPEG")
+    # Optimizamos un poco la compresión JPG para que viaje más rápido
+    image.save(buffered, format="JPEG", quality=85)
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return img_str
 
 def analizar_pagina_raw(image, prompt_sistema):
-    """Envía la petición 'a mano' para ignorar errores SSL"""
     try:
-        # 1. Preparamos la imagen
         b64_image = codificar_imagen_base64(image)
         
-        # 2. Preparamos el paquete de datos (Payload)
         payload = {
             "model": "llama3.2-vision",
             "format": "json",
@@ -92,14 +88,13 @@ def analizar_pagina_raw(image, prompt_sistema):
             ]
         }
         
-        # 3. ENVIAMOS LA PETICIÓN IGNORANDO SSL (verify=False)
-        # Esto es lo que soluciona tu error de desencriptación
+        # --- AQUÍ ESTÁ EL CAMBIO CLAVE: TIMEOUT 600 ---
         response = requests.post(
             f"{ngrok_url}/api/chat",
             json=payload,
             headers={'ngrok-skip-browser-warning': 'true'},
-            verify=False,  # <--- LA CLAVE DEL ÉXITO
-            timeout=120     # Esperamos hasta 2 minutos por página
+            verify=False,
+            timeout=600  # <--- 10 MINUTOS DE ESPERA (Antes eran 2)
         )
         
         if response.status_code == 200:
@@ -118,7 +113,9 @@ def analizar_pagina_raw(image, prompt_sistema):
 def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     try:
-        images = convert_from_path(pdf_path, dpi=200)
+        # --- CAMBIO CLAVE: BAJAMOS DPI A 150 ---
+        # Esto hace la imagen más pequeña y rápida de procesar para tu CPU
+        images = convert_from_path(pdf_path, dpi=150) 
     except Exception as e:
         return [], [], f"Error Poppler: {e}"
 
@@ -126,10 +123,9 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     resumen_local = []
     ultimo_factura = "S/N"
     
-    my_bar = st.progress(0, text=f"Enviando a tu casa: {filename}...")
+    my_bar = st.progress(0, text=f"Tu PC está pensando (Paciencia)... {filename}")
 
     for i, img in enumerate(images):
-        # Usamos la nueva función RAW
         data, error = analizar_pagina_raw(img, prompt)
         
         if error:
@@ -186,7 +182,7 @@ if uploaded_files and st.button("🚀 Procesar Remotamente"):
     
     for uploaded_file in uploaded_files:
         with st.expander(f"📄 {uploaded_file.name}", expanded=True):
-            with st.spinner(f"Tu PC está analizando (Esto puede tardar)..."):
+            with st.spinner(f"Tu PC está analizando (Puede tardar varios minutos)..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.read())
                     path = tmp.name
