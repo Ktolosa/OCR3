@@ -1,67 +1,48 @@
 import streamlit as st
 import pandas as pd
-from ollama import Client
 from pdf2image import convert_from_path
 import tempfile
 import os
 import json
 import io
+import requests # <--- Usamos requests para tener control total
+import base64
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
+# --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Nexus Híbrido", layout="wide")
-st.title("⚡ Nexus Extractor: Nube + Ollama Local")
+st.title("⚡ Nexus Extractor: Nube + Ollama Local (Modo Seguro)")
 
-# 1. CONEXIÓN AL TÚNEL (NGROK)
-# Buscamos la URL en los secretos de Streamlit
+# 1. RECUPERAR URL DE NGROK
 ngrok_url = st.secrets.get("OLLAMA_HOST")
 
 if not ngrok_url:
-    st.error("❌ No se encontró la dirección de tu Ollama Local.")
-    st.info("Configura el secreto 'OLLAMA_HOST' en Streamlit Cloud con tu URL de ngrok.")
+    st.error("❌ Falta el secreto 'OLLAMA_HOST'.")
     st.stop()
 
-# --- CORRECCIÓN CLAVE: HEADER PARA EVITAR ERROR DE NGROK ---
-try:
-    client = Client(
-        host=ngrok_url,
-        headers={'ngrok-skip-browser-warning': 'true'} # <--- ESTO SOLUCIONA EL BLOQUEO
-    )
-except Exception as e:
-    st.error(f"Error inicializando cliente: {e}")
-    st.stop()
+# Aseguramos que la URL no tenga barra al final
+ngrok_url = ngrok_url.rstrip('/')
 
 # ==========================================
 # 🧠 DEFINICIÓN DE PROMPTS
 # ==========================================
 PROMPTS_POR_TIPO = {
     "Factura Internacional (Regal/General)": """
-        Analiza la imagen de la factura.
-        REGLA DE FILTRADO:
-        1. Si el documento dice explícitamente "Duplicado" o "Copia", marca "tipo_documento" como "Copia" y deja "items" vacío.
-        2. Si dice "Original" o no especifica, extrae todo.
-        Responde SOLAMENTE con un JSON válido:
-        {"tipo_documento": "Original/Copia", "numero_factura": "Invoice #", "fecha": "YYYY-MM-DD", "orden_compra": "PO #", "proveedor": "Vendor Name", "cliente": "Sold To", "items": [{"modelo": "Model No", "descripcion": "Description", "cantidad": 0, "precio_unitario": 0.00, "origen": ""}], "total_factura": 0.00}
+        Analiza la imagen. Responde SOLO JSON:
+        {"tipo_documento": "Original", "numero_factura": "Invoice #", "fecha": "YYYY-MM-DD", "orden_compra": "PO #", "proveedor": "Vendor Name", "cliente": "Sold To", "items": [{"modelo": "Model No", "descripcion": "Description", "cantidad": 0, "precio_unitario": 0.00, "origen": ""}], "total_factura": 0.00}
     """,
     "Factura RadioShack": """
-        Analiza esta factura de RadioShack. Extrae datos en JSON. Usa SKU como modelo.
-        JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "RadioShack", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "origen": ""}], "total_factura": 0.0}
+        Analiza esta factura. JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "RadioShack", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "origen": ""}], "total_factura": 0.0}
     """,
     "Factura Mabe": """
-        Analiza esta factura de Mabe. Extrae datos en JSON. Usa CODIGO MABE como modelo.
-        JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "Mabe", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "origen": ""}], "total_factura": 0.0}
+        Analiza esta factura. JSON: {"tipo_documento": "Original", "numero_factura": "...", "fecha": "...", "proveedor": "Mabe", "cliente": "...", "items": [{"modelo": "...", "descripcion": "...", "cantidad": 0, "precio_unitario": 0.0, "origen": ""}], "total_factura": 0.0}
     """,
     "Factura Goodyear": """
         Analiza esta factura de Goodyear.
         INSTRUCCIONES:
-        1. NÚMERO DE FACTURA: Busca "INVOICE NUMBER". Si no aparece, usa "CONTINUACION".
-        2. TABLA DE ITEMS: 
-           - Code -> modelo
-           - Description -> descripcion
-           - Qty -> cantidad
-           - Unit Value -> precio_unitario
-           - Origin -> origen (Busca columnas "Origin", "Orig", "Ctry". Ej: Brazil, China. Si no hay, déjalo vacío "").
-        
-        Responde SOLAMENTE JSON:
+        1. Factura: Busca INVOICE NUMBER.
+        2. Items: Code->modelo, Description->descripcion, Qty->cantidad, Unit Value->precio_unitario.
+        3. Origen: Busca columna Origin/Orig/Ctry.
+        Responde SOLO JSON válido:
         {
             "tipo_documento": "Original",
             "numero_factura": "...",
@@ -81,39 +62,65 @@ PROMPTS_POR_TIPO = {
 }
 
 # ==========================================
-# 🛠️ FUNCIONES AUXILIARES
+# 🛠️ FUNCIONES MANUALES (SIN LIBRERÍA OLLAMA)
 # ==========================================
-def imagen_a_bytes(image):
+def codificar_imagen_base64(image):
+    """Convierte la imagen a texto Base64 para enviarla por HTTP"""
     buffered = io.BytesIO()
     image.save(buffered, format="JPEG")
-    return buffered.getvalue()
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return img_str
 
-def analizar_pagina(image, prompt_sistema):
+def analizar_pagina_raw(image, prompt_sistema):
+    """Envía la petición 'a mano' para ignorar errores SSL"""
     try:
-        img_bytes = imagen_a_bytes(image)
+        # 1. Preparamos la imagen
+        b64_image = codificar_imagen_base64(image)
         
-        # Llamada Remota a tu PC
-        response = client.chat(
-            model='llama3.2-vision', # Asegúrate de tener este modelo instalado en tu PC
-            format='json',
-            messages=[{
-                'role': 'user',
-                'content': prompt_sistema,
-                'images': [img_bytes]
-            }],
-            options={'temperature': 0}
+        # 2. Preparamos el paquete de datos (Payload)
+        payload = {
+            "model": "llama3.2-vision",
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt_sistema,
+                    "images": [b64_image]
+                }
+            ]
+        }
+        
+        # 3. ENVIAMOS LA PETICIÓN IGNORANDO SSL (verify=False)
+        # Esto es lo que soluciona tu error de desencriptación
+        response = requests.post(
+            f"{ngrok_url}/api/chat",
+            json=payload,
+            headers={'ngrok-skip-browser-warning': 'true'},
+            verify=False,  # <--- LA CLAVE DEL ÉXITO
+            timeout=120     # Esperamos hasta 2 minutos por página
         )
-        return json.loads(response['message']['content']), None
+        
+        if response.status_code == 200:
+            respuesta_json = response.json()
+            contenido = respuesta_json['message']['content']
+            return json.loads(contenido), None
+        else:
+            return {}, f"Error del Servidor ({response.status_code}): {response.text}"
 
     except Exception as e:
-        return {}, f"Error de Conexión (Ngrok/Ollama): {str(e)}"
+        return {}, f"Error de Conexión: {str(e)}"
 
+# ==========================================
+# ⚙️ PROCESAMIENTO
+# ==========================================
 def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     prompt = PROMPTS_POR_TIPO[tipo_seleccionado]
     try:
         images = convert_from_path(pdf_path, dpi=200)
     except Exception as e:
-        return [], [], f"Error leyendo PDF (Poppler): {e}"
+        return [], [], f"Error Poppler: {e}"
 
     items_locales = []
     resumen_local = []
@@ -122,7 +129,8 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
     my_bar = st.progress(0, text=f"Enviando a tu casa: {filename}...")
 
     for i, img in enumerate(images):
-        data, error = analizar_pagina(img, prompt)
+        # Usamos la nueva función RAW
+        data, error = analizar_pagina_raw(img, prompt)
         
         if error:
             st.error(f"Error {filename} Pág {i+1}: {error}")
@@ -141,7 +149,6 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
                     item["Factura_Origen"] = factura_id
                     item["Archivo_Origen"] = filename
                     
-                    # Rellenar campos faltantes
                     for k in ["origen", "modelo", "descripcion"]:
                         if k not in item: item[k] = ""
                     for k in ["cantidad", "precio_unitario"]:
@@ -149,12 +156,12 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
                         
                     items_locales.append(item)
             
-            # Resumen visual
+            # Resumen
             ya_existe = any(d['Factura'] == factura_id and d['Archivo'] == filename for d in resumen_local)
             if not ya_existe and factura_id != "S/N":
                 resumen_local.append({
-                    "Archivo": filename, 
-                    "Factura": factura_id, 
+                    "Archivo": filename,
+                    "Factura": factura_id,
                     "Total": data.get("total_factura")
                 })
         
@@ -169,7 +176,7 @@ def procesar_pdf(pdf_path, filename, tipo_seleccionado):
 with st.sidebar:
     st.header("Configuración")
     tipo_pdf = st.selectbox("Plantilla:", list(PROMPTS_POR_TIPO.keys()))
-    st.info("🟢 Conectado a Ollama Remoto")
+    st.info(f"Conectado a: {ngrok_url}")
 
 uploaded_files = st.file_uploader("Sube Facturas (PDF)", type=["pdf"], accept_multiple_files=True)
 
@@ -178,8 +185,8 @@ if uploaded_files and st.button("🚀 Procesar Remotamente"):
     st.divider()
     
     for uploaded_file in uploaded_files:
-        with st.expander(f"📄 Procesando: {uploaded_file.name}", expanded=True):
-            with st.spinner(f"Tu PC está analizando el documento..."):
+        with st.expander(f"📄 {uploaded_file.name}", expanded=True):
+            with st.spinner(f"Tu PC está analizando (Esto puede tardar)..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.read())
                     path = tmp.name
@@ -189,38 +196,33 @@ if uploaded_files and st.button("🚀 Procesar Remotamente"):
                 os.remove(path)
                 
                 if items:
-                    st.success(f"✅ {len(items)} items recibidos de tu PC.")
+                    st.success(f"✅ {len(items)} items recibidos.")
                     gran_acumulado.extend(items)
                 elif error:
                     st.error(error)
                 else:
-                    st.warning("⚠️ Sin datos extraíbles.")
+                    st.warning("⚠️ Sin datos.")
 
-    # --- GENERAR EXCEL FINAL ---
     if gran_acumulado:
         st.divider()
-        st.subheader("📥 Zona de Descargas")
+        st.subheader("📥 Descargas")
         
         df_final = pd.DataFrame(gran_acumulado)
-        
-        # Selección de columnas
         cols_deseadas = ['modelo', 'descripcion', 'cantidad', 'precio_unitario', 'origen', 'Factura_Origen']
         cols_existentes = [c for c in cols_deseadas if c in df_final.columns]
         df_export = df_final[cols_existentes]
         
         st.dataframe(df_export, use_container_width=True)
         
-        # Crear Excel en memoria
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_export.to_excel(writer, index=False, sheet_name='Items')
-            workbook = writer.book
             worksheet = writer.sheets['Items']
-            worksheet.set_column('B:B', 50) 
+            worksheet.set_column('B:B', 50)
             
         st.download_button(
-            label="📊 Descargar Excel Normal (.xlsx)",
+            label="📊 Descargar Excel",
             data=buffer.getvalue(),
-            file_name="Reporte_Remoto_Ollama.xlsx",
+            file_name="Reporte_Final.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
